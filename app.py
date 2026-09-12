@@ -105,11 +105,38 @@ SKILL_PATTERNS: dict[str, tuple[str, ...]] = {
     "communication": (r"\bcommunicat(?:e|es|ed|ing|ion)\b",),
 }
 
-JOB_CONTEXT_PATTERNS = (
-    r"^(?:we|our company|the company)\b",
-    r"^(?:key\s+)?(?:responsibilities|requirements|qualifications)\s*:?$",
-    r"^(?:nice\s+to\s+have|preferred qualifications|about the role)\s*:?$",
-    r"^job description\s*:?$",
+JOB_RELEVANT_SECTION_PATTERNS = (
+    r"\b(?:responsibilit(?:y|ies)|requirements?|qualifications?|"
+    r"qualities?|skills?|experience|preferred|must[- ]haves?|"
+    r"nice\s+to\s+have|what you(?:'ll| will) do|about the role|"
+    r"job description|role overview|be part of)\b",
+)
+
+JOB_IGNORED_SECTION_PATTERNS = (
+    r"^about\b",
+    r"\b(?:company|line of business|business overview|history|"
+    r"commitment|benefits?|culture|workplace|our values?|"
+    r"diversity|wellbeing)\b",
+)
+
+JOB_REQUIREMENT_SIGNAL_PATTERN = re.compile(
+    r"\b(?:ability|acceptance testing|agile|angularjs|analytical|"
+    r"architecture|architect(?:ed|ure)|aws|basic programming|build|"
+    r"c\+\+|cloud|code|coding|collaborat(?:e|ion)|compliance|"
+    r"conduct|critical thinking|database|develop(?:ed|ment)?|"
+    r"design|detail[- ]oriented|documentation|docker|engineering|"
+    r"framework|full[- ]stack|html5|implement(?:ed|ation)?|integrat(?:e|ion)|"
+    r"java(?:script)?|learn|manage|nodejs|nosql|object[- ]oriented|"
+    r"problem[- ]solving|program(?:ming)?|reactjs|requirement|"
+    r"sql|software|team|test(?:ed|ing)?|troubleshoot|use|"
+    r"write|worked|experience|knowledge|familiar|comfortable)\b",
+    re.IGNORECASE,
+)
+
+JOB_INTRO_PATTERN = re.compile(
+    r"^(?:we\s+are|we're|our\s+team\s+is|the\s+company\s+is)\s+"
+    r"(?:looking|seeking|hiring|searching)\b",
+    re.IGNORECASE,
 )
 
 RESUME_SECTION_NAMES = {
@@ -1179,40 +1206,61 @@ def preprocess_text(text: str) -> list[str]:
 
 
 def preprocess_job_requirements(text: str) -> list[str]:
-    """Extract actual job requirements instead of titles and boilerplate.
-
-    When a job posting contains bullets, only bullet lines are treated as
-    requirements. This removes role titles, introductions, and section labels
-    such as ``Key responsibilities and requirements:`` from the gap report.
-    For prose-only postings, sentence splitting is used with a small set of
-    generic context filters.
-    """
+    """Extract actionable requirements while skipping job-posting boilerplate."""
 
     if not isinstance(text, str):
         return []
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    bullet_candidates: list[str] = []
-    prose_candidates: list[str] = []
-    bullet_pattern = re.compile(r"^\s*(?:[-*•▪‣◦]|\d+[.)])\s*")
+    bullet_pattern = re.compile(r"^\s*(?:[-•▪‣◦]|(?<!\*)\*(?!\*)|\d+[.)])\s*")
+    items: list[tuple[str, bool, str | None]] = []
+    section_mode: str | None = None
+    pending_bullet_index: int | None = None
+    previous_line_was_blank = True
 
     for line in normalized.split("\n"):
         if not line.strip():
+            pending_bullet_index = None
+            previous_line_was_blank = True
             continue
 
         bullet_match = bullet_pattern.match(line)
         clean_line = bullet_pattern.sub("", line).strip()
+        clean_line = re.sub(r"^#{1,6}\s*", "", clean_line).strip()
+        clean_line = clean_line.replace("**", "").replace("__", "")
         if not clean_line:
             continue
 
-        if bullet_match:
-            # Keep bullets whole so tools stay paired with their actions.
-            bullet_candidates.append(clean_line)
+        if bullet_match is None:
+            heading_mode = classify_job_section_heading(line, clean_line)
+            if heading_mode is not None:
+                section_mode = heading_mode
+                pending_bullet_index = None
+                previous_line_was_blank = False
+                continue
+
+        is_bullet = bullet_match is not None
+        if (
+            not is_bullet
+            and pending_bullet_index is not None
+            and not previous_line_was_blank
+            and section_mode != "ignored"
+        ):
+            prior_text, _, prior_section = items[pending_bullet_index]
+            items[pending_bullet_index] = (
+                f"{prior_text} {clean_line}",
+                True,
+                prior_section,
+            )
         else:
             pieces = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", clean_line)
-            prose_candidates.extend(piece.strip() for piece in pieces if piece.strip())
+            for piece in pieces:
+                if piece.strip():
+                    items.append((piece.strip(), is_bullet, section_mode))
+            pending_bullet_index = len(items) - 1 if is_bullet else None
+        previous_line_was_blank = False
 
-    candidates = bullet_candidates if bullet_candidates else prose_candidates
+    has_bullets = any(is_bullet for _, is_bullet, _ in items)
     stop_words = {
         "a",
         "an",
@@ -1229,28 +1277,37 @@ def preprocess_job_requirements(text: str) -> list[str]:
     chunks: list[str] = []
     seen: set[str] = set()
 
-    for candidate in candidates:
+    for candidate, is_bullet, item_section in items:
         cleaned = re.sub(r"\s+", " ", candidate).strip(" \t-–—")
         if len(cleaned) < MIN_CHUNK_CHARACTERS:
             continue
 
-        if not bullet_candidates:
-            lower_cleaned = cleaned.casefold()
-            if any(re.search(pattern, lower_cleaned) for pattern in JOB_CONTEXT_PATTERNS):
+        lower_cleaned = cleaned.casefold()
+        if item_section == "ignored" or JOB_INTRO_PATTERN.search(cleaned):
+            continue
+
+        words = re.findall(r"[A-Za-z0-9]+", lower_cleaned)
+        has_skill_signal = any(
+            re.search(pattern, lower_cleaned)
+            for patterns in SKILL_PATTERNS.values()
+            for pattern in patterns
+        )
+        has_requirement_signal = bool(
+            JOB_REQUIREMENT_SIGNAL_PATTERN.search(cleaned) or has_skill_signal
+        )
+
+        if is_bullet:
+            # Relevant sections keep even concise qualities such as "Detail-oriented".
+            if item_section not in {"relevant", None} and not has_requirement_signal:
+                continue
+            if item_section is None and not has_requirement_signal:
+                continue
+        else:
+            if has_bullets and item_section not in {"relevant", "unknown"}:
+                continue
+            if not has_requirement_signal or len(words) < 5:
                 continue
 
-            # Exclude short role titles that are not requirements.
-            if (
-                len(cleaned.split()) <= 10
-                and re.search(r"\b(?:analyst|engineer|scientist|manager|developer)\b", lower_cleaned)
-                and not re.search(
-                    r"\b(?:write|use|build|work|design|apply|maintain|develop|analy[sz]e|experience)\b",
-                    lower_cleaned,
-                )
-            ):
-                continue
-
-        words = re.findall(r"[A-Za-z0-9]+", cleaned.lower())
         if not words or all(word in stop_words for word in words):
             continue
 
@@ -1261,6 +1318,37 @@ def preprocess_job_requirements(text: str) -> list[str]:
         chunks.append(cleaned)
 
     return chunks
+
+
+def classify_job_section_heading(raw_line: str, cleaned_line: str) -> str | None:
+    """Classify a likely heading as relevant, ignored, or unknown."""
+
+    raw = raw_line.strip()
+    words = re.findall(r"[A-Za-z0-9]+", cleaned_line)
+    looks_like_markdown_heading = raw.startswith(("#", "**", "__"))
+    looks_like_title = (
+        len(words) <= 10
+        and not re.search(r"[.!?]$", cleaned_line)
+        and (
+            cleaned_line == cleaned_line.title()
+            or cleaned_line.isupper()
+            or cleaned_line.rstrip().endswith(":")
+            or cleaned_line.casefold().startswith("about ")
+        )
+    )
+    if not looks_like_markdown_heading and not looks_like_title:
+        return None
+
+    normalized = cleaned_line.casefold().strip()
+    if ":" in normalized and not normalized.endswith(":"):
+        return None
+    normalized = normalized.strip(" :–—-")
+    if any(re.search(pattern, normalized) for pattern in JOB_RELEVANT_SECTION_PATTERNS):
+        return "relevant"
+    if any(re.search(pattern, normalized) for pattern in JOB_IGNORED_SECTION_PATTERNS):
+        return "ignored"
+
+    return "unknown" if looks_like_markdown_heading or looks_like_title else None
 
 
 def identify_resume_section(line: str) -> str | None:
@@ -1491,11 +1579,13 @@ def run_alignment(
     threshold_index: float,
     syllabus_chunks_override: Sequence[str] | None = None,
     resume_text: str | None = None,
+    job_chunks_override: Sequence[str] | None = None,
 ) -> AlignmentResult:
     """Preprocess, embed, compare, and summarize one alignment audit.
 
     Imported NUSMods modules can be passed as overrides so each module remains
     one atomic syllabus item even when its description contains paragraphs.
+    Reviewed job requirements can also be passed as an explicit override.
     """
 
     module_syllabus_chunks = [
@@ -1505,7 +1595,15 @@ def run_alignment(
     ]
     manual_syllabus_chunks = preprocess_text(syllabus_text)
     syllabus_chunks = module_syllabus_chunks + manual_syllabus_chunks
-    job_chunks = preprocess_job_requirements(job_text)
+    job_chunks = (
+        [
+            chunk.strip()
+            for chunk in job_chunks_override
+            if isinstance(chunk, str) and chunk.strip()
+        ]
+        if job_chunks_override is not None
+        else preprocess_job_requirements(job_text)
+    )
 
     if not syllabus_chunks:
         raise ValueError(
@@ -1659,12 +1757,12 @@ def style_dashboard_dataframe(
     return styler.set_table_styles(DASHBOARD_TABLE_STYLES)
 
 
-def render_matrix(result: AlignmentResult) -> None:
-    """Render the job-by-syllabus hybrid alignment matrix as a heatmap table."""
+def render_matrix(result: AlignmentResult) -> tuple[str, ...]:
+    """Render the heatmap and return requirements the user marked for removal."""
 
     if pd is None:
         st.error("Pandas is unavailable, so the alignment matrix cannot be rendered.")
-        return
+        return ()
 
     requirement_labels = [
         f"R{index + 1}: {shorten(requirement)}"
@@ -1687,9 +1785,63 @@ def render_matrix(result: AlignmentResult) -> None:
     )
     st.dataframe(
         styled_frame,
-        use_container_width=True,
+        width="stretch",
         height=min(720, 160 + 42 * len(result.job_chunks)),
     )
+
+    st.markdown("**Review requirements in the matrix**")
+    st.caption(
+        "Uncheck any false-positive or irrelevant job requirement, then apply the removals. "
+        "The audit will recalculate using only the requirements you keep."
+    )
+    editor_frame = matrix_frame.copy()
+    editor_frame.insert(0, "Include", [True] * len(result.job_chunks))
+    editor_frame.insert(1, "Job requirement", list(result.job_chunks))
+    editor_config: dict[str, Any] = {
+        "Include": st.column_config.CheckboxColumn(
+            "Include",
+            help="Uncheck to remove this requirement from the audit.",
+            default=True,
+        ),
+        "Job requirement": st.column_config.TextColumn(
+            "Job requirement",
+            width="large",
+        ),
+    }
+    for module_label in module_labels:
+        editor_config[module_label] = st.column_config.NumberColumn(
+            module_label,
+            format="%.0f",
+        )
+
+    editor_revision = st.session_state.get("alignment_revision", 0)
+    with st.form(
+        f"requirement_filter_form_{editor_revision}",
+        clear_on_submit=False,
+    ):
+        edited_frame = st.data_editor(
+            editor_frame,
+            key=f"requirement_filter_editor_{editor_revision}",
+            width="stretch",
+            hide_index=True,
+            disabled=["Job requirement", *module_labels],
+            column_config=editor_config,
+        )
+        apply_removals = st.form_submit_button("Apply requirement removals")
+
+    if apply_removals:
+        included = [bool(value) for value in edited_frame["Include"]]
+        removed = tuple(
+            requirement
+            for requirement, keep in zip(result.job_chunks, included)
+            if not keep
+        )
+        if len(removed) == len(result.job_chunks):
+            st.error("Keep at least one job requirement in the audit.")
+            return ()
+        if removed:
+            return removed
+        st.info("No requirements were removed from this audit.")
 
     with st.expander("View full requirement and module labels"):
         label_frame = pd.DataFrame(
@@ -1708,9 +1860,52 @@ def render_matrix(result: AlignmentResult) -> None:
         )
         st.dataframe(
             style_dashboard_dataframe(label_frame, apply_gradient=False),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
+
+    return ()
+
+
+def recalculate_without_requirements(
+    result: AlignmentResult,
+    removed_requirements: Sequence[str],
+) -> AlignmentResult | None:
+    """Re-run the audit after the user removes false-positive requirements."""
+
+    source = st.session_state.get("alignment_source")
+    if not isinstance(source, dict):
+        st.error("The original audit inputs are unavailable. Run the audit again first.")
+        return None
+
+    removed = set(removed_requirements)
+    remaining_requirements = [
+        requirement for requirement in result.job_chunks if requirement not in removed
+    ]
+    if not remaining_requirements:
+        st.error("Keep at least one job requirement in the audit.")
+        return None
+
+    with st.spinner("Recalculating the audit with the selected requirements…"):
+        try:
+            return run_alignment(
+                str(source.get("syllabus_text", "")),
+                str(source.get("job_text", "")),
+                float(source.get("threshold_index", result.threshold_index)),
+                syllabus_chunks_override=tuple(
+                    source.get("loaded_module_texts", ())
+                ),
+                resume_text=source.get("resume_text"),
+                job_chunks_override=remaining_requirements,
+            )
+        except (ValueError, RuntimeError) as exc:
+            st.error(str(exc))
+        except Exception:
+            LOGGER.exception("Unexpected requirement filtering error")
+            st.error(
+                "The audit could not be recalculated. Run the audit again and try once more."
+            )
+    return None
 
 
 def render_met_requirements(result: AlignmentResult) -> None:
@@ -1795,7 +1990,7 @@ def render_coverage_summary(result: AlignmentResult) -> None:
     )
     st.dataframe(
         style_dashboard_dataframe(summary, apply_gradient=False),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Requirements": st.column_config.NumberColumn(format="%d"),
@@ -1854,7 +2049,7 @@ def render_resume_alignment(result: AlignmentResult) -> None:
     )
     st.dataframe(
         styled_frame,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(540, 150 + 44 * len(rows)),
     )
@@ -1899,7 +2094,7 @@ def render_nusmods_lookup() -> None:
         )
         lookup_clicked = st.form_submit_button(
             "Load from NUSMods",
-            use_container_width=True,
+            width="stretch",
         )
 
     if lookup_clicked:
@@ -2004,7 +2199,7 @@ def render_loaded_nusmods_modules() -> None:
                     unsafe_allow_html=True,
                 )
             with remove_col:
-                if st.button("✕", key=f"remove_nusmods_{module_code}", use_container_width=True):
+                if st.button("✕", key=f"remove_nusmods_{module_code}", width="stretch"):
                     del st.session_state["nusmods_modules"][module_code]
                     st.rerun()
 
@@ -2054,6 +2249,12 @@ def render_sidebar() -> tuple[str, str, float, bool, tuple[str, ...], Any]:
             height=320,
             help="Include responsibilities, required skills, and preferred qualifications.",
         )
+        detected_requirements = preprocess_job_requirements(job_text)
+        if detected_requirements:
+            st.caption(
+                f"{len(detected_requirements)} actionable requirements detected. "
+                "Company background, culture, benefits, and section headings are excluded."
+            )
         with st.form("alignment_controls", clear_on_submit=False):
             threshold = st.slider(
                 "Minimum Alignment Index",
@@ -2071,7 +2272,7 @@ def render_sidebar() -> tuple[str, str, float, bool, tuple[str, ...], Any]:
             submitted = st.form_submit_button(
                 "Run Alignment Audit",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
 
         st.divider()
@@ -2224,7 +2425,7 @@ def render_mod_comparison(job_text: str, threshold_index: float) -> None:
         compare_clicked = st.form_submit_button(
             "Compare Modules",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if compare_clicked:
@@ -2371,7 +2572,7 @@ def render_mod_comparison(job_text: str, threshold_index: float) -> None:
                 },
                 gradient_subset=["Alignment Index"],
             ),
-            use_container_width=True,
+        width="stretch",
             hide_index=True,
         )
 
@@ -2439,6 +2640,17 @@ def render_audit_workspace(
 
         st.session_state["alignment_result"] = result
         st.session_state["alignment_threshold_index"] = threshold
+        st.session_state["alignment_source"] = {
+            "syllabus_text": syllabus_text,
+            "job_text": job_text,
+            "threshold_index": threshold,
+            "loaded_module_texts": loaded_module_texts,
+            "resume_text": resume_text,
+        }
+        st.session_state["alignment_removed_job_requirements"] = ()
+        st.session_state["alignment_revision"] = (
+            int(st.session_state.get("alignment_revision", 0)) + 1
+        )
         st.session_state["resume_audited_filename"] = (
             resume_file.name if resume_file is not None else None
         )
@@ -2448,10 +2660,18 @@ def render_audit_workspace(
         render_empty_state()
         return
 
+    removed_count = len(
+        st.session_state.get("alignment_removed_job_requirements", ())
+    )
+    removal_note = (
+        f" · {removed_count} manually excluded"
+        if removed_count
+        else ""
+    )
     st.markdown(
         f'<div class="audit-status"><span class="audit-status-icon">✓</span>'
         f'<span>Audit complete · compared {len(result.job_chunks)} job requirements '
-        f'against {len(result.syllabus_chunks)} syllabus modules/topics.</span></div>',
+        f'against {len(result.syllabus_chunks)} syllabus modules/topics{removal_note}.</span></div>',
         unsafe_allow_html=True,
     )
 
@@ -2479,7 +2699,28 @@ def render_audit_workspace(
         "evidence, then maps the result to a calibrated 0–100 index. Green indicates stronger "
         "alignment; yellow/red indicates weaker alignment."
     )
-    render_matrix(result)
+    removed_requirements = render_matrix(result)
+    if removed_requirements:
+        updated_result = recalculate_without_requirements(
+            result,
+            removed_requirements,
+        )
+        if updated_result is not None:
+            previous_removed = list(
+                st.session_state.get("alignment_removed_job_requirements", ())
+            )
+            for requirement in removed_requirements:
+                if requirement not in previous_removed:
+                    previous_removed.append(requirement)
+            st.session_state["alignment_removed_job_requirements"] = tuple(
+                previous_removed
+            )
+            st.session_state["alignment_result"] = updated_result
+            st.session_state["alignment_revision"] = (
+                int(st.session_state.get("alignment_revision", 0)) + 1
+            )
+            st.rerun()
+        return
 
     left_col, right_col = st.columns([1.35, 1])
     with left_col:
