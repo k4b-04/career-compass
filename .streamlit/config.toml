@@ -1,0 +1,5 @@
+[server]
+# The Transformers package uses lazy imports for optional vision models.
+# Streamlit's source watcher can inspect those modules and trigger imports
+# such as ZoeDepth, even though Career Compass only uses text embeddings.
+fileWatcherType = "none"
