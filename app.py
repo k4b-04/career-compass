@@ -2539,12 +2539,14 @@ def run_app_safely() -> None:
 
     try:
         main()
-    except Exception:
+    except Exception as exc:
         LOGGER.exception("Unhandled Career Compass application error")
         st.error(
             "Career Compass could not render this page because of an unexpected application error. "
             "Please refresh the app and try again."
         )
+        with st.expander("Technical detail"):
+            st.code(f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
