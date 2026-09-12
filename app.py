@@ -1649,7 +1649,12 @@ def style_dashboard_dataframe(
         }
         if gradient_subset is not None:
             gradient_kwargs["subset"] = list(gradient_subset)
-        styler = styler.background_gradient(**gradient_kwargs)
+        try:
+            styler = styler.background_gradient(**gradient_kwargs)
+        except ImportError:
+            LOGGER.warning(
+                "Matplotlib is unavailable; rendering the dataframe without a heatmap."
+            )
 
     return styler.set_table_styles(DASHBOARD_TABLE_STYLES)
 
